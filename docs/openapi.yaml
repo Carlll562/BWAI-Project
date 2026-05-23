@@ -1,0 +1,739 @@
+openapi: 3.0.3
+info:
+  title: Campus Event Aggregator & Conflict-Prevention Engine API
+  description: |
+    This is the complete backend API documentation for the Campus Event Aggregator and Conflict-Prevention Engine.
+    The system is a centralized event platform combining rigid scheduling/conflict-prevention logic (MySQL 8.0) 
+    with highly performant and flexible tag-based event discovery (MongoDB).
+    
+    ### Access Control & RBAC
+    The system uses **Role-Based Access Control (RBAC)** enforced at the API boundary using JSON Web Token (JWT) claims.
+    There are three roles defined:
+    1. **`STUDENT`**: General campus discovery users who can browse approved events and RSVP.
+    2. **`ORGANIZER`**: Student organization leaders who submit event proposals, verify conflicts, and scan check-in QR codes.
+    3. **`ADMIN`**: High-privilege faculty or administrator approvers who review, approve, or reject event schedules.
+    
+    All secure endpoints must bear a Bearer Authentication token.
+  version: 1.0.0
+servers:
+  - url: http://localhost:5000/api
+    description: Local Development Server
+paths:
+  /events:
+    get:
+      summary: Get Approved Events (Student Discovery Feed)
+      description: |
+        Retrieves all approved events from the MongoDB document store.
+        
+        **RBAC Privilege Level**: Public (accessible to `STUDENT`, `ORGANIZER`, and `ADMIN`).
+      operationId: getEvents
+      parameters:
+        - name: tag
+          in: query
+          description: Filter by a singular interest tag
+          required: false
+          schema:
+            type: string
+        - name: tags
+          in: query
+          description: Comma-separated list of interest tags (e.g. `tech,academic,social`). Filters via Logical OR.
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Successfully fetched approved discovery events
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  events:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/EventDocument'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    post:
+      summary: Propose New Event
+      description: |
+        Submits a draft event proposal. Runs the proposal through the 2-Stage Conflict Prevention Engine.
+        If a hard conflict is encountered (Venue Closed or Venue Double-Booked), the request is immediately rejected.
+        If soft conflicts exist, the proposal is registered with state `NEEDS_REVIEW`.
+        If no conflicts exist, the proposal is registered with state `PENDING`.
+        
+        **RBAC Privilege Level**: Requires **`ORGANIZER`** or **`ADMIN`** role.
+      operationId: proposeEvent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EventProposal'
+      responses:
+        '201':
+          description: Event proposed successfully. Registered in MySQL and drafted in MongoDB.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: "Event proposed successfully"
+                  eventId:
+                    type: integer
+                    example: 45
+                  status:
+                    type: string
+                    enum: [PENDING, NEEDS_REVIEW]
+                    example: "NEEDS_REVIEW"
+                  warnings:
+                    type: array
+                    items:
+                      type: string
+                    example: ["Less than 15-minute buffer between events at same venue"]
+        '400':
+          description: Zod validation failure (e.g. missing fields, or start time >= end time)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationError'
+        '409':
+          description: Hard scheduling conflict encountered. Proposal is immediately discarded.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: false
+                  message:
+                    type: string
+                    enum: ["Venue Closed", "Venue Double Booked"]
+                    example: "Venue Double Booked"
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /events/venues:
+    get:
+      summary: Fetch All Venues
+      description: |
+        Retrieves a complete list of campus physical venues, operating times, and capacities.
+        
+        **RBAC Privilege Level**: Public (accessible to `STUDENT`, `ORGANIZER`, and `ADMIN`).
+      operationId: getVenues
+      responses:
+        '200':
+          description: List of venues successfully retrieved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  venues:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Venue'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /events/check-conflicts:
+    post:
+      summary: Dry-Run Conflict Validation
+      description: |
+        Allows front-end dashboards to check for scheduling conflicts prior to submission, providing live UI feedback.
+        
+        **RBAC Privilege Level**: Requires **`ORGANIZER`** or **`ADMIN`** role.
+      operationId: checkConflictsEndpoint
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EventProposal'
+      responses:
+        '200':
+          description: Conflict check complete. No database writes performed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  hasHardConflict:
+                    type: boolean
+                    example: false
+                  warnings:
+                    type: array
+                    items:
+                      type: string
+                    example: ["Audience overlap: tech"]
+                  venueName:
+                    type: string
+                    example: "Venue A"
+                  venueCapacity:
+                    type: integer
+                    example: 100
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /events/proposals:
+    get:
+      summary: Fetch Event Proposals Queue
+      description: |
+        Retrieves list of event proposals. Used by Admins to browse the review queue, and Organizers to monitor submission history.
+        
+        **RBAC Privilege Level**:
+        - **`ADMIN`**: Can fetch all records.
+        - **`ORGANIZER`**: Must filter by their own `organizationId` parameter.
+      operationId: getProposals
+      parameters:
+        - name: organizationId
+          in: query
+          description: ID of proposing organization (Required for organizers, optional for admins)
+          required: false
+          schema:
+            type: integer
+        - name: status
+          in: query
+          description: Filter proposals by status
+          required: false
+          schema:
+            type: string
+            enum: [PENDING, APPROVED, REJECTED, NEEDS_REVIEW]
+      responses:
+        '200':
+          description: Successfully retrieved merged proposal records
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  proposals:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/MergedProposal'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /events/{id}/approve:
+    post:
+      summary: Approve Event Proposal
+      description: |
+        Transition event state to APPROVED. Logs the administrative audit trail in MySQL and updates MongoDB status to synchronise with the Discovery Feed.
+        
+        **RBAC Privilege Level**: Requires **`ADMIN`** role.
+      operationId: approveProposal
+      parameters:
+        - name: id
+          in: path
+          description: The event schedule ID
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                adminId:
+                  type: integer
+                  description: ID of the approving administrator
+                  example: 1
+                reason:
+                  type: string
+                  description: Optional comment regarding scheduling or capacity allocation
+                  example: "Sufficient capacity and time slots allocated."
+      responses:
+        '200':
+          description: Proposal approved and synchronized to MongoDB successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: "Proposal approved successfully, synchronized with MongoDB Discovery feed."
+        '404':
+          description: Proposal ID not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /events/{id}/reject:
+    post:
+      summary: Reject Event Proposal
+      description: |
+        Transition event state to REJECTED. Logs the action and required justification in MySQL and updates MongoDB state.
+        
+        **RBAC Privilege Level**: Requires **`ADMIN`** role.
+      operationId: rejectProposal
+      parameters:
+        - name: id
+          in: path
+          description: The event schedule ID
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - reason
+              properties:
+                adminId:
+                  type: integer
+                  description: ID of the rejecting administrator
+                  example: 1
+                reason:
+                  type: string
+                  description: Mandatory justification explaining the rejection
+                  example: "High schedule overlap density with other tag-matching activities."
+      responses:
+        '200':
+          description: Proposal rejected successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: "Proposal rejected and synchronized to MongoDB document."
+        '400':
+          description: Rejection reason missing in request body
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: false
+                  message:
+                    type: string
+                    example: "A rejection reason is strictly required"
+        '404':
+          description: Proposal ID not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /events/{id}/rsvp:
+    post:
+      summary: Register Student RSVP
+      description: |
+        Enrolls a student for an APPROVED event, preventing double RSVP, inserts a secure validation signature in MySQL and increments MongoDB counts.
+        
+        **RBAC Privilege Level**: Requires **`STUDENT`** or **`ORGANIZER`** role.
+      operationId: rsvpEvent
+      parameters:
+        - name: id
+          in: path
+          description: The event schedule ID
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userId:
+                  type: integer
+                  description: ID of student RSVPing
+                  example: 10
+      responses:
+        '201':
+          description: RSVP successfully submitted. Returns custom entry QR signature string.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: "RSVP registered successfully."
+                  qrSignature:
+                    type: string
+                    example: "RSVP-45-10-KDF82NS"
+        '400':
+          description: Event is not approved or does not exist
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: false
+                  message:
+                    type: string
+                    example: "Cannot RSVP to an unapproved or non-existent event."
+        '409':
+          description: Student already registered RSVP for this event
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: false
+                  message:
+                    type: string
+                    example: "You have already RSVP’d to this event."
+                  qrSignature:
+                    type: string
+                    example: "RSVP-45-10-KDF82NS"
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /events/rsvp/scan:
+    post:
+      summary: Door Check-In Scanner
+      description: |
+        Validates check-in by scanning ticket QR signature, marks attendee checked_in = TRUE in MySQL to prevent reuse.
+        
+        **RBAC Privilege Level**: Requires **`ORGANIZER`** (or door monitor) role.
+      operationId: scanRSVP
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - qrSignature
+              properties:
+                qrSignature:
+                  type: string
+                  description: The unique QR Signature string parsed from the scanner
+                  example: "RSVP-45-10-KDF82NS"
+      responses:
+        '200':
+          description: Attendee successfully checked in.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: "Check-in successful! Welcome to the event."
+                  attendee:
+                    type: string
+                    example: "student.email@campus.edu"
+                  eventId:
+                    type: integer
+                    example: 45
+        '400':
+          description: QR signature parameter is missing
+        '404':
+          description: QR code signature is invalid
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: false
+                  message:
+                    type: string
+                    example: "Invalid QR signature. Event check-in access denied."
+        '409':
+          description: Attendee has already been checked in (Ticket reuse attempt)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: false
+                  message:
+                    type: string
+                    example: "Attendee has already checked in for this event."
+                  attendee:
+                    type: string
+                    example: "student.email@campus.edu"
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+  schemas:
+    EventProposal:
+      type: object
+      required:
+        - organizationId
+        - venueId
+        - startTime
+        - endTime
+        - metadata
+      properties:
+        organizationId:
+          type: integer
+          description: Primary key of organization user account
+          example: 1
+        venueId:
+          type: integer
+          description: Primary key of venue
+          example: 1
+        startTime:
+          type: string
+          format: date-time
+          description: ISO 8601 UTC start timestamp
+          example: "2026-10-15T15:00:00.000Z"
+        endTime:
+          type: string
+          format: date-time
+          description: ISO 8601 UTC end timestamp (must be strictly after startTime)
+          example: "2026-10-15T17:00:00.000Z"
+        metadata:
+          type: object
+          required:
+            - title
+          properties:
+            title:
+              type: string
+              minLength: 3
+              maxLength: 100
+              description: Event name
+              example: "Campus Fall Hackathon"
+            description:
+              type: string
+              description: Broad descriptive summary (Markdown-friendly)
+              example: "A 24-hour programming competition for students of all faculties."
+            tags:
+              type: array
+              items:
+                type: string
+              example: ["tech", "hackathon"]
+
+    EventDocument:
+      type: object
+      properties:
+        _id:
+          type: string
+          description: MongoDB hexadecimal document key
+          example: "60c72b2f9b1d8b2bad0343a4"
+        mysql_event_id:
+          type: integer
+          description: Primary key link to SQL event_schedules
+          example: 45
+        title:
+          type: string
+          example: "Campus Fall Hackathon"
+        description:
+          type: string
+          example: "A 24-hour programming competition."
+        tags:
+          type: array
+          items:
+            type: string
+          example: ["tech", "hackathon"]
+        organizer_name:
+          type: string
+          example: "ACM STUDENT CHAPTER"
+        venue:
+          type: object
+          properties:
+            venue_id:
+              type: integer
+              example: 1
+            name:
+              type: string
+              example: "Venue A"
+            capacity:
+              type: integer
+              example: 100
+        schedule:
+          type: object
+          properties:
+            start_time:
+              type: string
+              format: date-time
+              example: "2026-10-15T15:00:00.000Z"
+            end_time:
+              type: string
+              format: date-time
+              example: "2026-10-15T17:00:00.000Z"
+        status:
+          type: string
+          enum: [APPROVED, REJECTED, PENDING, NEEDS_REVIEW]
+          example: "APPROVED"
+        rsvps_count:
+          type: integer
+          example: 15
+        media_urls:
+          type: array
+          items:
+            type: string
+          example: []
+
+    MergedProposal:
+      type: object
+      properties:
+        id:
+          type: integer
+          description: MySQL event primary key
+          example: 45
+        organizationId:
+          type: integer
+          example: 1
+        venueId:
+          type: integer
+          example: 1
+        venueName:
+          type: string
+          example: "Venue A"
+        venueCapacity:
+          type: integer
+          example: 100
+        organizerEmail:
+          type: string
+          example: "acm@campus.edu"
+        organizerName:
+          type: string
+          example: "ACM STUDENT CHAPTER"
+        startTime:
+          type: string
+          format: date-time
+          example: "2026-10-15T15:00:00.000Z"
+        endTime:
+          type: string
+          format: date-time
+          example: "2026-10-15T17:00:00.000Z"
+        status:
+          type: string
+          enum: [PENDING, APPROVED, REJECTED, NEEDS_REVIEW]
+          example: "NEEDS_REVIEW"
+        createdAt:
+          type: string
+          format: date-time
+          example: "2026-05-23T14:58:53.000Z"
+        title:
+          type: string
+          example: "Campus Fall Hackathon"
+        description:
+          type: string
+          example: "A 24-hour programming competition."
+        tags:
+          type: array
+          items:
+            type: string
+          example: ["tech", "hackathon"]
+        rsvpsCount:
+          type: integer
+          example: 0
+
+    Venue:
+      type: object
+      properties:
+        id:
+          type: integer
+          example: 1
+        name:
+          type: string
+          example: "Venue A"
+        capacity:
+          type: integer
+          example: 100
+        operating_start:
+          type: string
+          description: Standard time format HH:MM:SS
+          example: "08:00:00"
+        operating_end:
+          type: string
+          description: Standard time format HH:MM:SS
+          example: "22:00:00"
+
+    ValidationError:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: false
+        message:
+          type: string
+          example: "JSON Schema validation failed"
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              path:
+                type: string
+                example: "metadata.title"
+              message:
+                type: string
+                example: "metadata.title must be at least 3 characters long"
+
+    NotFoundError:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: false
+        message:
+          type: string
+          example: "Event proposal not found"
+
+  responses:
+    InternalError:
+      description: Internal Server Error fallback catch-all response
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              success:
+                type: boolean
+                example: false
+              message:
+                type: string
+                example: "Internal server error occurred."
